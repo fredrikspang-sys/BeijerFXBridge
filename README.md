@@ -57,8 +57,10 @@ The **Probe panel** button opens a read-only network scan to find the panel:
 
 - If a Panel IP is set it is checked first (ping, TCP connect and UDP check on the configured port).
 - **Scan** checks the local subnet of each ticked network adapter (max 1024 addresses per range).
-  Tick *Include external networks* to also scan ZeroTier/VPN subnets and, for Tailscale, the
-  subnet routes via the Tailscale adapter plus peers from `tailscale status --json` (longer timeouts).
+  Tailscale/ZeroTier/VPN adapters are unticked by default; tick one to scan its subnet and, for
+  Tailscale, the subnet routes via that adapter plus peers from `tailscale status --json` (longer timeouts).
+- Only likely panels are listed (Beijer MAC, TCP port open, or UDP open|filtered with no web server)
+  plus the configured host; tick *Show all hosts* to list every responder.
 - *Extra range* accepts e.g. `192.168.3.0/24` or `10.0.2.1-50`.
 - Results show ping time, TCP and UDP result for the port, HTTP title/Server on port 80, MAC from the
   ARP table and *Likely panel* (Beijer Electronics MAC OUI). MAC detection only works on the local L2 network.

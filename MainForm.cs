@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Globalization;
+using System.Linq;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace BeijerFXBridge;
@@ -10,11 +12,13 @@ sealed class MainForm : Form
 {
     const int MaxLogLines = 1000;
     readonly Dictionary<string, string> cfg = Config.Load();
-    readonly TextBox host, port, com, plc, log;
+    readonly ComboBox host; readonly TextBox port, com, plc, log;
     readonly ComboBox proto, baud, parity, bits, stop;
     readonly Label status = new() { Dock = DockStyle.Bottom, Height = 24, Text = "Stopped", Padding = new Padding(8, 4, 8, 0) };
     readonly Button btnStart = new() { Text = "Start bridge", AutoSize = true };
     readonly Button btnStop = new() { Text = "Stop", AutoSize = true, Enabled = false };
+    readonly Button btnFind = new() { Text = "Find", Width = 60, Dock = DockStyle.Right };
+    CancellationTokenSource findCts;
     Bridge bridge;
 
     public MainForm()
@@ -27,7 +31,10 @@ sealed class MainForm : Form
         var grid = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, Padding = new Padding(8) };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 130));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        host = Row(grid, "Panel IP", new TextBox { Text = cfg["host"] });
+        host = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, Text = cfg["host"], Dock = DockStyle.Fill };
+        var hostRow = Row(grid, "Panel IP", new Panel { Height = 24, Margin = new Padding(3, 2, 3, 2) });
+        hostRow.Controls.Add(host); hostRow.Controls.Add(btnFind);
+        new ToolTip().SetToolTip(btnFind, "Quick read-only scan of the local Ethernet/Wi-Fi subnets for the panel");
         port = Row(grid, "Port", new TextBox { Text = cfg["port"] });
         proto = Row(grid, "Protocol", Combo(cfg["protocol"].ToUpperInvariant(), "UDP", "TCP"));
         baud = Row(grid, "Baud", Combo(cfg["baud"], "9600", "19200", "38400", "57600", "115200"));
@@ -65,6 +72,13 @@ sealed class MainForm : Form
         btnStop.Click += (_, _) => StopBridge();
         clear.Click += (_, _) => log.Clear();
         probe.Click += (_, _) => OpenProbe();
+        btnFind.Click += async (_, _) => await FindPanel();
+        host.SelectedIndexChanged += (_, _) =>
+        {
+            if (host.SelectedItem is not ProbeForm.Candidate c) return;
+            if (c.Protocol != null) proto.SelectedItem = c.Protocol;
+            BeginInvoke(new Action(() => { host.Text = c.Ip; host.Select(host.Text.Length, 0); }));
+        };
         quit.Click += (_, _) => Close();
         FormClosing += (_, _) => { bridge?.Dispose(); bridge = null; };
         AppendLog($"Config: {Config.FilePath}");
@@ -110,7 +124,7 @@ sealed class MainForm : Form
     {
         ["com"] = com.Text.Trim(),
         ["plc_com"] = plc.Text.Trim(),
-        ["host"] = host.Text.Trim(),
+        ["host"] = HostText(),
         ["port"] = port.Text.Trim(),
         ["protocol"] = proto.Text.ToLowerInvariant(),
         ["baud"] = baud.Text,
@@ -124,13 +138,50 @@ sealed class MainForm : Form
     {
         int.TryParse(port.Text.Trim(), out int p);
         if (p <= 0 || p > 65535) p = 6004;
-        using var f = new ProbeForm(host.Text.Trim(), p, (ip, protocol) =>
+        using var f = new ProbeForm(HostText(), p, (ip, protocol) =>
         {
             host.Text = ip;
             if (protocol != null) proto.SelectedItem = protocol;
             AppendLog($"Probe: panel IP set to {ip}" + (protocol != null ? $" ({protocol})" : "") + " - press Save settings or Start bridge to keep it");
         });
         f.ShowDialog(this);
+    }
+
+    // Typed text, or just the IP part if a "IP  (name / reason)" entry is shown.
+    string HostText() => (host.Text.Trim().Split(new[] { ' ' }, 2)[0]);
+
+    async System.Threading.Tasks.Task FindPanel()
+    {
+        if (findCts != null) { findCts.Cancel(); return; }
+        int.TryParse(port.Text.Trim(), out int p);
+        if (p <= 0 || p > 65535) p = 6004;
+        findCts = new CancellationTokenSource();
+        string before = status.Text;
+        btnFind.Text = "Cancel"; status.Text = "Finding panel on the local network...";
+        UseWaitCursor = true; btnFind.UseWaitCursor = false; btnFind.Cursor = Cursors.Default;
+        try
+        {
+            var hits = await ProbeForm.QuickFind(p, findCts.Token);
+            host.Items.Clear();
+            if (hits.Count == 0) { status.Text = "Find: no likely panel found on the local network"; AppendLog(status.Text); return; }
+            if (hits.Count == 1)
+            {
+                host.Text = hits[0].Ip;
+                if (hits[0].Protocol != null) proto.SelectedItem = hits[0].Protocol;
+                status.Text = $"Find: panel {hits[0]}";
+            }
+            else
+            {
+                host.Items.AddRange(hits.Cast<object>().ToArray());
+                host.SelectedIndex = 0; // best first
+                status.Text = $"Find: {hits.Count} candidates - pick one in the Panel IP list";
+                host.DroppedDown = true;
+            }
+            AppendLog(status.Text + " - press Save settings or Start bridge to keep it");
+        }
+        catch (OperationCanceledException) { status.Text = before; AppendLog("Find cancelled"); }
+        catch (Exception e) { status.Text = "Find failed: " + e.Message; }
+        finally { findCts.Dispose(); findCts = null; btnFind.Text = "Find"; UseWaitCursor = false; }
     }
 
     void StartBridge()
