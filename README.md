@@ -99,12 +99,3 @@ Build on Linux (Wine with the null display driver works headless):
 
 MIT, see [LICENSE](LICENSE). The installer also installs it as `LICENSE.txt`.
 The bundled com0com is GPL (`installer/com0com/COPYING.txt`).
-
-## Short UDP replies (1.2.3)
-
-In UDP mode the panel sometimes answers a request with only part of the reply, and the PLC software then
-stalls until its own retry. With `fix_short_replies = true` (default) the bridge buffers the reply until it
-reaches `expected_reply` bytes (default 70; 0 = learn the most common length). If it stays short for
-`reply_wait_ms` (default 100), the partial is dropped and the last request is resent, up to `max_resends`
-(default 2); after that whatever arrived is forwarded so the PLC software can retry. Longer replies are passed
-through unchanged. TCP mode is not affected. Missing keys in an existing config.ini use these defaults.

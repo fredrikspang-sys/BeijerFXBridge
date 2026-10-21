@@ -58,8 +58,8 @@ static class Program
 
 static class Config
 {
-    static readonly string[] Keys = { "com", "plc_com", "host", "port", "protocol", "baud", "parity", "bytesize", "stopbits", "bind", "local_port", "verbose", "fix_short_replies", "expected_reply", "reply_wait_ms", "max_resends" };
-    static readonly string[] Defaults = { "COM11", "COM10", "10.0.2.10", "6004", "udp", "115200", "E", "7", "1", "0.0.0.0", "0", "true", "true", "70", "100", "2" };
+    static readonly string[] Keys = { "com", "plc_com", "host", "port", "protocol", "baud", "parity", "bytesize", "stopbits", "bind", "local_port", "verbose" };
+    static readonly string[] Defaults = { "COM11", "COM10", "10.0.2.10", "6004", "udp", "115200", "E", "7", "1", "0.0.0.0", "0", "true" };
 
     public static string FilePath => Path.Combine(AppContext.BaseDirectory, "config.ini");
 
@@ -95,13 +95,7 @@ static class Config
 sealed class Bridge : IDisposable
 {
     readonly Action<string> log;
-    readonly bool verbose, tcpMode, fixShort;
-    readonly int expectedReply, replyWaitMs, maxResends;
-    // UDP short-reply repair state (guarded by fixLock)
-    readonly object fixLock = new();
-    byte[] lastReq; readonly List<byte> pending = new(); int resends;
-    readonly Dictionary<int, int> lenHist = new(); int learned;
-    long shortReplies, resendCount, recovered;
+    readonly bool verbose, tcpMode;
     readonly string banner;
     readonly IPEndPoint peer;
     readonly SerialPort ser;
@@ -118,10 +112,6 @@ sealed class Bridge : IDisposable
         this.log = log;
         verbose = c["verbose"].Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
         tcpMode = c["protocol"].Trim().ToLowerInvariant() == "tcp";
-        fixShort = !tcpMode && c["fix_short_replies"].Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
-        expectedReply = Math.Max(0, int.TryParse(c["expected_reply"].Trim(), out var er) ? er : 70);
-        replyWaitMs = Math.Max(10, int.TryParse(c["reply_wait_ms"].Trim(), out var rw) ? rw : 100);
-        maxResends = Math.Max(0, int.TryParse(c["max_resends"].Trim(), out var mr) ? mr : 2);
         double stop = double.Parse(c["stopbits"], CultureInfo.InvariantCulture);
         banner = $"Bridging {c["com"]} <-> {(tcpMode ? "TCP" : "UDP")} {c["host"]}:{c["port"]}  {c["baud"]} {c["bytesize"]}{c["parity"]}{(int)stop}";
         string host = c["host"].Trim();
@@ -159,8 +149,7 @@ sealed class Bridge : IDisposable
         new Thread(Stats) { IsBackground = true, Name = "stats" }.Start();
         if (tcpMode) log($"TCP connected to {peer}");
         new Thread(ComToNet) { IsBackground = true, Name = "com2net" }.Start();
-        if (fixShort) log($"Short-reply repair on: expected {(expectedReply > 0 ? expectedReply + " B" : "auto-learn")}, wait {replyWaitMs} ms, max {maxResends} resend(s)");
-        new Thread(fixShort ? UdpToComFixed : NetToCom) { IsBackground = true, Name = "net2com" }.Start();
+        new Thread(NetToCom) { IsBackground = true, Name = "net2com" }.Start();
     }
 
     public void Stop() => cts.Cancel();
@@ -181,96 +170,10 @@ sealed class Bridge : IDisposable
         while (!Stopped.WaitOne(10000))
         {
             long c = Interlocked.Read(ref comIn), n = Interlocked.Read(ref netIn);
-            if (c != lastC || n != lastN) log($"Bytes: COM->net {c}, net->COM {n}" + FixStats());
+            if (c != lastC || n != lastN) log($"Bytes: COM->net {c}, net->COM {n}");
             lastC = c; lastN = n;
         }
-        log($"Stopped. Bytes: COM->net {Interlocked.Read(ref comIn)}, net->COM {Interlocked.Read(ref netIn)}" + FixStats());
-    }
-
-    string FixStats() => fixShort ? $", short replies {Interlocked.Read(ref shortReplies)}, resends {Interlocked.Read(ref resendCount)}, recovered {Interlocked.Read(ref recovered)}" : "";
-
-    int Expected() => expectedReply > 0 ? expectedReply : learned;
-
-    void WriteCom(byte[] d, int n, string what)
-    {
-        Interlocked.Add(ref netIn, n);
-        ser.Write(d, 0, n);
-        V($"UDP->COM {n} B{what}");
-    }
-
-    // UDP mode with fix_short_replies: assemble the panel's reply to the expected length; if it stays short,
-    // drop the partial and resend the last request (max_resends), then fall back to forwarding what we have.
-    void UdpToComFixed()
-    {
-        while (!IsStopped)
-        {
-            byte[] data = null; IPEndPoint ep = new(IPAddress.Any, 0);
-            bool waiting;
-            lock (fixLock) waiting = pending.Count > 0;
-            try
-            {
-                udp.Client.ReceiveTimeout = waiting ? replyWaitMs : 0;
-                data = udp.Receive(ref ep);
-            }
-            catch (SocketException e) when (e.SocketErrorCode == SocketError.TimedOut) { }
-            catch (Exception e) { if (IsStopped) return; log($"Net recv error: {e.Message}"); Thread.Sleep(100); continue; }
-            try
-            {
-                lock (fixLock)
-                {
-                    if (data == null) // reply_wait_ms passed with a partial reply buffered
-                    {
-                        if (pending.Count == 0) continue;
-                        int got = pending.Count;
-                        if (lastReq != null && resends < maxResends)
-                        {
-                            if (resends == 0) Interlocked.Increment(ref shortReplies);
-                            resends++; Interlocked.Increment(ref resendCount);
-                            log($"short reply {got} B, resend #{resends}");
-                            pending.Clear();
-                            udp.Send(lastReq, lastReq.Length, peer);
-                        }
-                        else
-                        {
-                            if (resends == 0) Interlocked.Increment(ref shortReplies);
-                            log($"short reply {got} B" + (resends > 0 ? $" after {resends} resend(s)" : "") + ", forwarding as-is");
-                            var a = pending.ToArray(); pending.Clear(); resends = 0;
-                            WriteCom(a, a.Length, " (short)");
-                        }
-                        continue;
-                    }
-                    if (data.Length == 0) continue;
-                    if (!ep.Address.Equals(peer.Address)) { V($"ignore UDP from {ep}"); continue; }
-                    int exp = Expected();
-                    if (exp <= 0 || lastReq == null) // learning, or unsolicited: pass straight through
-                    {
-                        if (exp <= 0) Learn(data.Length);
-                        WriteCom(data, data.Length, $" from {ep}");
-                        continue;
-                    }
-                    pending.AddRange(data);
-                    if (pending.Count >= exp)
-                    {
-                        var a = pending.ToArray(); pending.Clear();
-                        if (resends > 0) { Interlocked.Increment(ref recovered); log($"recovered after {resends} resend(s)"); }
-                        resends = 0;
-                        if (expectedReply <= 0) Learn(a.Length);
-                        WriteCom(a, a.Length, $" from {ep}");
-                    }
-                }
-            }
-            catch (Exception e) { if (!IsStopped) log($"Serial write error: {e.Message}"); Stop(); return; }
-        }
-    }
-
-    void Learn(int len)
-    {
-        lenHist[len] = lenHist.TryGetValue(len, out var k) ? k + 1 : 1;
-        if (lenHist.Values.Sum() >= 5)
-        {
-            int best = lenHist.OrderByDescending(x => x.Value).First().Key;
-            if (best != learned) { learned = best; log($"Learned reply length {best} B"); }
-        }
+        log($"Stopped. Bytes: COM->net {Interlocked.Read(ref comIn)}, net->COM {Interlocked.Read(ref netIn)}");
     }
 
     void V(string msg) { if (verbose) log(msg); }
@@ -327,12 +230,6 @@ sealed class Bridge : IDisposable
             Interlocked.Add(ref comIn, n);
             if (!tcpMode)
             {
-                if (fixShort)
-                    lock (fixLock)
-                    {
-                        if (pending.Count > 0) V($"new request: dropping {pending.Count} B partial reply");
-                        pending.Clear(); resends = 0; lastReq = buf.Take(n).ToArray();
-                    }
                 try { udp.Send(buf, n, peer); V($"COM->UDP {n} B to {peer}"); }
                 catch (Exception e) { if (!IsStopped) log($"Net send error: {e.Message}"); }
                 continue;
