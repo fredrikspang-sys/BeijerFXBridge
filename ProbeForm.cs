@@ -270,20 +270,26 @@ sealed class ProbeForm : Form
 
     // Quick LAN-only search used by the main window's Find button: up physical Ethernet/Wi-Fi adapters only,
     // same read-only probe, returns likely panels best first.
-    public static async Task<List<Candidate>> QuickFind(int port, CancellationToken ct)
+    public static async Task<List<Candidate>> QuickFind(int port, string cfgHost, CancellationToken ct, Action<string> stats = null)
     {
         using var f = new ProbeForm("", port, (_, _) => { });
         var targets = f.found.Where(x => x.Physical && !x.External && !x.Virtual && x.Mask != 0xFFFFFFFF).Select(x => Net(x.Addr, x.Mask, false, x.Name)).ToList();
         var ips = new Dictionary<uint, Target>();
         foreach (var t in targets) for (ulong a = t.First; a <= t.Last; a++) if (!ips.ContainsKey((uint)a)) ips[(uint)a] = t;
         foreach (var x in f.found) ips.Remove(x.Addr);
+        uint cfgIp = 0;
+        if (!string.IsNullOrWhiteSpace(cfgHost) && IPAddress.TryParse(cfgHost.Trim(), out var ch) && ch.AddressFamily == AddressFamily.InterNetwork)
+            ips[cfgIp = ToU(ch)] = new Target { First = cfgIp, Last = cfgIp, Source = "configured host" };
+        var arp0 = ArpTable(); // hosts already in the ARP cache are probed even if they ignore ping
         var results = new List<Result>(); var gate = new SemaphoreSlim(Parallel);
         await Task.WhenAll(ips.Select(async kv =>
         {
             try
             {
                 await gate.WaitAsync(ct).ConfigureAwait(false);
-                try { var r = await f.ProbeHost(ToIp(kv.Key), false, true, false, kv.Value.Source, false, ct).ConfigureAwait(false); if (r != null) lock (results) results.Add(r); }
+                try { var ip = ToIp(kv.Key); bool cfg = kv.Key == cfgIp && cfgIp != 0;
+                    var r = await f.ProbeHost(ip, false, false, false, kv.Value.Source, cfg || arp0.ContainsKey(ip.ToString()), ct, 1000).ConfigureAwait(false);
+                    if (r != null) { r.Configured = cfg; lock (results) results.Add(r); } }
                 finally { gate.Release(); }
             }
             catch (OperationCanceledException) { }
@@ -292,7 +298,8 @@ sealed class ProbeForm : Form
         var arp = ArpTable();
         foreach (var r in results)
             if (arp.TryGetValue(r.Ip, out var mac)) { r.Mac = mac; if (BeijerOui.ContainsKey(mac.Substring(0, 8))) r.Panel = true; }
-        var hits = results.Where(r => Likely(r) != "").OrderBy(Rank).ThenBy(r => ToU(IPAddress.Parse(r.Ip))).ToList();
+        var hits = results.Where(r => Likely(r) != "" || (r.Configured && (r.Ms >= 0 || r.Tcp == "open"))).OrderBy(Rank).ThenBy(r => ToU(IPAddress.Parse(r.Ip))).ToList();
+        stats?.Invoke($"scanned {ips.Count}, alive {results.Count(r => r.Ms >= 0 || r.Tcp == "open" || r.Tcp == "closed")}, candidates {hits.Count}");
         await Task.WhenAll(hits.Select(async r =>
         {
             r.Name = await ReverseDns(r.Ip, 1000).ConfigureAwait(false) ?? await NetBiosName(r.Ip, 600).ConfigureAwait(false)
@@ -300,7 +307,7 @@ sealed class ProbeForm : Form
         })).ConfigureAwait(false);
         return hits.Select(r => new Candidate
         {
-            Ip = r.Ip, Name = r.Name, Reason = Likely(r),
+            Ip = r.Ip, Name = r.Name, Reason = (r.Configured ? "configured" + (Likely(r) != "" ? ", " : "") : "") + Likely(r),
             Protocol = r.Tcp == "open" ? "TCP" : r.Udp.StartsWith("open") ? "UDP" : null,
         }).ToList();
     }
@@ -339,11 +346,11 @@ sealed class ProbeForm : Form
 
     void BeginInvokeSafe(Action a) { try { if (IsHandleCreated) BeginInvoke(a); } catch (InvalidOperationException) { } }
 
-    async Task<Result> ProbeHost(IPAddress ip, bool slow, bool doHttp, bool readId, string src, bool always, CancellationToken ct)
+    async Task<Result> ProbeHost(IPAddress ip, bool slow, bool doHttp, bool readId, string src, bool always, CancellationToken ct, int tmo = 0)
     {
-        int pingMs = slow ? 1500 : 400, tcpMs = slow ? 1500 : 500, udpMs = slow ? 1500 : 600;
+        int pingMs = tmo > 0 ? tmo : slow ? 1500 : 400, tcpMs = tmo > 0 ? tmo : slow ? 1500 : 500, udpMs = tmo > 0 ? tmo : slow ? 1500 : 600;
         var r = new Result { Ip = ip.ToString(), Source = src };
-        try { using var p = new Ping(); var rep = await p.SendPingAsync(ip, pingMs).ConfigureAwait(false); if (rep.Status == IPStatus.Success) r.Ms = rep.RoundtripTime; } catch { }
+        try { using var p = new Ping(); var rep = await p.SendPingAsync(ip, pingMs).ConfigureAwait(false); if (rep.Status != IPStatus.Success) rep = await p.SendPingAsync(ip, pingMs).ConfigureAwait(false); /* one retry */ if (rep.Status == IPStatus.Success) r.Ms = rep.RoundtripTime; } catch { }
         ct.ThrowIfCancellationRequested();
         r.Tcp = await TcpCheck(ip, cfgPort, tcpMs).ConfigureAwait(false) switch { true => "open", false => "closed", _ => "no reply" };
         bool alive = r.Ms >= 0 || r.Tcp != "no reply";

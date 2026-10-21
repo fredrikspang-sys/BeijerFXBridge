@@ -161,20 +161,21 @@ sealed class MainForm : Form
         UseWaitCursor = true; btnFind.UseWaitCursor = false; btnFind.Cursor = Cursors.Default;
         try
         {
-            var hits = await ProbeForm.QuickFind(p, findCts.Token);
+            string dbg = "";
+            var hits = await ProbeForm.QuickFind(p, HostText(), findCts.Token, x => dbg = x);
             host.Items.Clear();
-            if (hits.Count == 0) { status.Text = "Find: no likely panel found on the local network"; AppendLog(status.Text); return; }
+            if (hits.Count == 0) { status.Text = $"Find: no likely panel found on the local network ({dbg})"; AppendLog(status.Text); return; }
             if (hits.Count == 1)
             {
                 host.Text = hits[0].Ip;
                 if (hits[0].Protocol != null) proto.SelectedItem = hits[0].Protocol;
-                status.Text = $"Find: panel {hits[0]}";
+                status.Text = $"Find: panel {hits[0]}  ({dbg})";
             }
             else
             {
                 host.Items.AddRange(hits.Cast<object>().ToArray());
                 host.SelectedIndex = 0; // best first
-                status.Text = $"Find: {hits.Count} candidates - pick one in the Panel IP list";
+                status.Text = $"Find: {hits.Count} candidates - pick one in the Panel IP list ({dbg})";
                 host.DroppedDown = true;
             }
             AppendLog(status.Text + " - press Save settings or Start bridge to keep it");
