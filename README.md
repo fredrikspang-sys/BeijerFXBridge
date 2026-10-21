@@ -51,6 +51,21 @@ reconnects every 2 s if the link drops.
 - CLI: `BeijerFXBridgeNet.exe --cli [--com COM11] [--host 10.0.0.10] [--port 6004] [--protocol udp|tcp]`
   (also `--baud --parity --bytesize --stopbits --bind --local-port -v`, `--help`). Ctrl+C stops.
 
+## Probe panel
+
+The **Probe panel** button opens a read-only network scan to find the panel:
+
+- If a Panel IP is set it is checked first (ping, TCP connect and UDP check on the configured port).
+- **Scan** checks the local subnet of each ticked network adapter (max 1024 addresses per range).
+  Tick *Include external networks* to also scan ZeroTier/VPN subnets and, for Tailscale, the
+  subnet routes via the Tailscale adapter plus peers from `tailscale status --json` (longer timeouts).
+- *Extra range* accepts e.g. `192.168.3.0/24` or `10.0.2.1-50`.
+- Results show ping time, TCP and UDP result for the port, HTTP title/Server on port 80, MAC from the
+  ARP table and *Likely panel* (Beijer Electronics MAC OUI). MAC detection only works on the local L2 network.
+- Double-click a row or press **Use** to set Panel IP (and the protocol that answered).
+
+The probe only sends ping, TCP connects, one empty UDP datagram and an HTTP GET; no PLC data, no COM ports.
+
 ## Build (Linux or Windows, .NET SDK)
 
 Targets .NET Framework 4.8, which is built into Windows 10/11, so the exe runs
@@ -76,7 +91,7 @@ Build on Linux (Wine with the null display driver works headless):
     export WINEPREFIX=~/.wine-inno
     wine reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d null /f
     wine innosetup-6.7.3.exe /VERYSILENT /SUPPRESSMSGBOXES /SP- '/DIR=C:\InnoSetup6'
-    installer/build.sh     # -> installer/Output/BeijerFXBridge-1.0.0-setup.exe
+    installer/build.sh     # -> installer/Output/BeijerFXBridge-1.1.0-setup.exe
 
 ## License
 

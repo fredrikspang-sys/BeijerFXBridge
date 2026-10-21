@@ -4,14 +4,14 @@
 [Setup]
 AppId={{7C3E1B52-9A4D-4F0B-8E21-5D6A3F9C2B17}
 AppName=Beijer FX Bridge
-AppVersion=1.0.0
+AppVersion=1.1.0
 DefaultDirName={autopf}\BeijerFXBridge
 DefaultGroupName=Beijer FX Bridge
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=Output
-OutputBaseFilename=BeijerFXBridge-1.0.0-setup
+OutputBaseFilename=BeijerFXBridge-1.1.0-setup
 SetupIconFile=..\icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 WizardStyle=modern

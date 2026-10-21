@@ -51,9 +51,10 @@ sealed class MainForm : Form
 
         var save = new Button { Text = "Save settings", AutoSize = true };
         var clear = new Button { Text = "Clear log", AutoSize = true };
+        var probe = new Button { Text = "Probe panel", AutoSize = true };
         var quit = new Button { Text = "Quit", AutoSize = true, Dock = DockStyle.Right };
         var flow = new FlowLayoutPanel { Dock = DockStyle.Fill };
-        flow.Controls.AddRange(new Control[] { save, btnStart, btnStop, clear });
+        flow.Controls.AddRange(new Control[] { save, btnStart, btnStop, probe, clear });
         var bar = new Panel { Dock = DockStyle.Bottom, Height = 40, Padding = new Padding(4) };
         bar.Controls.Add(flow);
         bar.Controls.Add(quit);
@@ -63,6 +64,7 @@ sealed class MainForm : Form
         btnStart.Click += (_, _) => StartBridge();
         btnStop.Click += (_, _) => StopBridge();
         clear.Click += (_, _) => log.Clear();
+        probe.Click += (_, _) => OpenProbe();
         quit.Click += (_, _) => Close();
         FormClosing += (_, _) => { bridge?.Dispose(); bridge = null; };
         AppendLog($"Config: {Config.FilePath}");
@@ -116,6 +118,20 @@ sealed class MainForm : Form
         ["bytesize"] = bits.Text,
         ["stopbits"] = stop.Text,
     };
+
+    // Network-only probe; never touches COM ports or the running bridge.
+    void OpenProbe()
+    {
+        int.TryParse(port.Text.Trim(), out int p);
+        if (p <= 0 || p > 65535) p = 6004;
+        using var f = new ProbeForm(host.Text.Trim(), p, (ip, protocol) =>
+        {
+            host.Text = ip;
+            if (protocol != null) proto.SelectedItem = protocol;
+            AppendLog($"Probe: panel IP set to {ip}" + (protocol != null ? $" ({protocol})" : "") + " - press Save settings or Start bridge to keep it");
+        });
+        f.ShowDialog(this);
+    }
 
     void StartBridge()
     {
