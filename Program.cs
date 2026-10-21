@@ -121,7 +121,12 @@ sealed class Bridge : IDisposable
             c["parity"].Trim().ToUpperInvariant() switch { "N" => Parity.None, "O" => Parity.Odd, _ => Parity.Even },
             int.Parse(c["bytesize"]),
             stop == 2 ? StopBits.Two : stop == 1.5 ? StopBits.OnePointFive : StopBits.One)
-        { ReadTimeout = 500, WriteTimeout = 2000 };
+        {
+            // Match pyserial defaults: DTR and RTS asserted, no flow control. com0com wires our DTR/RTS to the
+            // other side's DSR/DCD and CTS; with them low, GX on the paired port aborts at once.
+            Handshake = Handshake.None, DtrEnable = true, RtsEnable = true,
+            ReadTimeout = 500, WriteTimeout = 2000, ReadBufferSize = 65536, WriteBufferSize = 65536,
+        };
         var bind = new IPEndPoint(IPAddress.Parse(c["bind"]), int.Parse(c["local_port"]));
         try { ser.Open(); }
         catch (Exception e) { throw new Exception($"Cannot open {ser.PortName}: {e.Message}"); }
@@ -136,6 +141,12 @@ sealed class Bridge : IDisposable
     public void Start()
     {
         log(banner);
+        log($"Serial {ser.PortName} open: {ser.BaudRate} {ser.DataBits}{ser.Parity.ToString()[0]}{(ser.StopBits == StopBits.Two ? 2 : 1)}, " +
+            $"DTR={(ser.DtrEnable ? "on" : "off")} RTS={(ser.RtsEnable ? "on" : "off")}, handshake {ser.Handshake}; " +
+            $"peer signals CTS={(ser.CtsHolding ? "on" : "off")} DSR={(ser.DsrHolding ? "on" : "off")} DCD={(ser.CDHolding ? "on" : "off")}");
+        if (!tcpMode) log($"UDP local {((IPEndPoint)udp.Client.LocalEndPoint)} -> {peer}");
+        log("Bridge started; waiting for data from the PLC software");
+        new Thread(Stats) { IsBackground = true, Name = "stats" }.Start();
         if (tcpMode) log($"TCP connected to {peer}");
         new Thread(ComToNet) { IsBackground = true, Name = "com2net" }.Start();
         new Thread(NetToCom) { IsBackground = true, Name = "net2com" }.Start();
@@ -149,6 +160,20 @@ sealed class Bridge : IDisposable
         try { ser.Close(); } catch { }
         try { udp?.Close(); } catch { }
         try { tcp?.Close(); } catch { }
+    }
+
+    long comIn, netIn; // bytes COM->net and net->COM
+
+    void Stats()
+    {
+        long lastC = 0, lastN = 0;
+        while (!Stopped.WaitOne(10000))
+        {
+            long c = Interlocked.Read(ref comIn), n = Interlocked.Read(ref netIn);
+            if (c != lastC || n != lastN) log($"Bytes: COM->net {c}, net->COM {n}");
+            lastC = c; lastN = n;
+        }
+        log($"Stopped. Bytes: COM->net {Interlocked.Read(ref comIn)}, net->COM {Interlocked.Read(ref netIn)}");
     }
 
     void V(string msg) { if (verbose) log(msg); }
@@ -201,6 +226,8 @@ sealed class Bridge : IDisposable
             try { n = ser.Read(buf, 0, buf.Length); }
             catch (TimeoutException) { continue; }
             catch (Exception e) { if (!IsStopped) log($"Serial error: {e.Message}"); Stop(); return; }
+            if (n <= 0) continue;
+            Interlocked.Add(ref comIn, n);
             if (!tcpMode)
             {
                 try { udp.Send(buf, n, peer); V($"COM->UDP {n} B to {peer}"); }
@@ -245,6 +272,7 @@ sealed class Bridge : IDisposable
                 }
             }
             catch (Exception e) { if (IsStopped) return; log($"Net recv error: {e.Message}"); Thread.Sleep(100); continue; }
+            Interlocked.Add(ref netIn, n);
             try { ser.Write(data, 0, n); V($"{(tcpMode ? "TCP" : "UDP")}->COM {n} B from {from}"); }
             catch (Exception e) { if (!IsStopped) log($"Serial write error: {e.Message}"); Stop(); return; }
         }
