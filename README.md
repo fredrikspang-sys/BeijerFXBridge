@@ -9,6 +9,12 @@ through the panel.
 
 ![Beijer FX Bridge running](screenshot.png)
 
+*Main window. **Find**, next to Panel IP, opens the Probe panel.*
+
+![Probe panel](probe-panel.png)
+
+*Probe panel: scans the ticked network adapters for Beijer panels (detected by MAC vendor, ping and TCP/UDP 6004); **Use** sets the panel IP.*
+
     PLC software --COM10== com0com ==COM11-- BeijerFXBridgeNet --UDP/TCP--> panel :6004 --> PLC
 
 ## com0com setup
