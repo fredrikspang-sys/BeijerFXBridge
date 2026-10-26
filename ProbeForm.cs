@@ -16,7 +16,7 @@ using System.Windows.Forms;
 
 namespace BeijerFXBridge;
 
-// Read-only network probe: ICMP ping, TCP connect, empty UDP datagram, optional HTTP GET /.
+// Read-only network probe: ARP requests on the local segment, ICMP ping, TCP connect, empty UDP datagram, optional HTTP GET /.
 // Never opens COM ports and never sends PLC protocol bytes.
 sealed class ProbeForm : Form
 {
@@ -85,7 +85,7 @@ sealed class ProbeForm : Form
         foreach (var (t, w) in new[] { ("IP", 110), ("Hostname", 130), ("Likely panel", 85), ("Device type", 190), ("MAC", 125), ("Ping ms", 60), ($"TCP {port}", 70), ($"UDP {port}", 95), ("HTTP :80", 170), ("Via", 150) })
             list.Columns.Add(t, w);
         info.Text = "MAC/vendor detection only works on the local L2 network (not through routers or VPNs). " +
-                    "Probe sends ping, TCP connects, one empty UDP datagram and HTTP GET / only; identity reads are opt-in and read-only. Never writes.";
+                    "Probe sends ARP requests (local subnets only), ping, TCP connects, one empty UDP datagram and HTTP GET / only; identity reads are opt-in and read-only. Never writes.";
         Controls.AddRange(new Control[] { list, top, progress, info });
 
         showAll.CheckedChanged += (_, _) => Render();
@@ -232,14 +232,17 @@ sealed class ProbeForm : Form
         var results = new List<Result>();
         var gate = new SemaphoreSlim(Parallel);
         int done = 0;
-        info.Text = $"Scanning {ips.Count} addresses: " + string.Join(", ", targets.Select(t => $"{ToIp(t.First)}-{ToIp(t.Last)} ({t.Source})"));
+        info.Text = $"ARP sweep of on-link addresses, then scanning {ips.Count} addresses: " + string.Join(", ", targets.Select(t => $"{ToIp(t.First)}-{ToIp(t.Last)} ({t.Source})"));
+        var arpKnown = await Task.Run(ArpTable);
+        foreach (var kv in await ArpSweep(ips.Keys.Where(OnLink), ct)) arpKnown[kv.Key] = kv.Value; // ARP-only hosts (ignore ping) are probed too
         var tasks = ips.Select(async kv =>
         {
             await gate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
                 bool isCfg = kv.Value.Source == "configured host";
-                var r = await ProbeHost(ToIp(kv.Key), kv.Value.External, doHttp, doId, kv.Value.Source, isCfg, ct).ConfigureAwait(false);
+                var ip = ToIp(kv.Key);
+                var r = await ProbeHost(ip, kv.Value.External, doHttp, doId, kv.Value.Source, isCfg || arpKnown.ContainsKey(ip.ToString()), ct).ConfigureAwait(false);
                 if (r != null) r.Configured = isCfg;
                 if (r != null) lock (results) results.Add(r);
             }
@@ -249,6 +252,7 @@ sealed class ProbeForm : Form
         try { await Task.WhenAll(tasks); } catch (OperationCanceledException) { }
 
         var arp = await Task.Run(ArpTable);
+        foreach (var kv in arpKnown) if (!arp.ContainsKey(kv.Key)) arp[kv.Key] = kv.Value;
         foreach (var r in results)
             if (arp.TryGetValue(r.Ip, out var mac))
             {
@@ -281,6 +285,8 @@ sealed class ProbeForm : Form
         if (!string.IsNullOrWhiteSpace(cfgHost) && IPAddress.TryParse(cfgHost.Trim(), out var ch) && ch.AddressFamily == AddressFamily.InterNetwork)
             ips[cfgIp = ToU(ch)] = new Target { First = cfgIp, Last = cfgIp, Source = "configured host" };
         var arp0 = ArpTable(); // hosts already in the ARP cache are probed even if they ignore ping
+        foreach (var kv in await ArpSweep(ips.Keys.Where(f.OnLink), ct).ConfigureAwait(false)) arp0[kv.Key] = kv.Value; // plus hosts answering ARP now
+        ct.ThrowIfCancellationRequested();
         var results = new List<Result>(); var gate = new SemaphoreSlim(Parallel);
         await Task.WhenAll(ips.Select(async kv =>
         {
@@ -296,6 +302,7 @@ sealed class ProbeForm : Form
         })).ConfigureAwait(false);
         ct.ThrowIfCancellationRequested();
         var arp = ArpTable();
+        foreach (var kv in arp0) if (!arp.ContainsKey(kv.Key)) arp[kv.Key] = kv.Value;
         foreach (var r in results)
             if (arp.TryGetValue(r.Ip, out var mac)) { r.Mac = mac; if (BeijerOui.ContainsKey(mac.Substring(0, 8))) r.Panel = true; }
         var hits = results.Where(r => Likely(r) != "" || (r.Configured && (r.Ms >= 0 || r.Tcp == "open"))).OrderBy(Rank).ThenBy(r => ToU(IPAddress.Parse(r.Ip))).ToList();
@@ -612,13 +619,14 @@ sealed class ProbeForm : Form
         return $"EtherNet/IP: {vn} {name} rev {b[54]}.{b[55]} (product {product})".Replace("  ", " ");
     }
 
-    // --- iphlpapi: route table and ARP table (read-only) ---
+    // --- iphlpapi: route table, ARP table and ARP requests (read-only) ---
     [StructLayout(LayoutKind.Sequential)]
     struct MIB_IPFORWARDROW { public uint Dest, Mask, Policy, NextHop; public int IfIndex; public uint Type, Proto, Age, NextHopAS, Metric1, Metric2, Metric3, Metric4, Metric5; }
     [StructLayout(LayoutKind.Sequential)]
     struct MIB_IPNETROW { public int Index; public int PhysAddrLen; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)] public byte[] Phys; public uint Addr; public int Type; }
     [DllImport("iphlpapi.dll")] static extern int GetIpForwardTable(IntPtr table, ref int size, bool order);
     [DllImport("iphlpapi.dll")] static extern int GetIpNetTable(IntPtr table, ref int size, bool order);
+    [DllImport("iphlpapi.dll")] static extern int SendARP(uint destIp, uint srcIp, byte[] macAddr, ref int macLen); // IPs in network byte order
 
     delegate int TableFn(IntPtr table, ref int size, bool order);
 
@@ -644,6 +652,43 @@ sealed class ProbeForm : Form
     {
         try { return Table<MIB_IPFORWARDROW>(GetIpForwardTable).Where(r => r.IfIndex == ifIndex).Select(r => (Swap(r.Dest), Swap(r.Mask))).Distinct().ToList(); }
         catch { return new(); }
+    }
+
+    // On-link = inside the subnet of a real (non-VPN, non-virtual) adapter; ARP only works on the local segment.
+    bool OnLink(uint a) => found.Any(x => !x.External && !x.Virtual && x.Mask != 0xFFFFFFFF && x.Mask != 0 && (a & x.Mask) == (x.Addr & x.Mask) && a != x.Addr);
+
+    // Sends one ARP request per address via SendARP (blocks ~1-3 s per silent host, so run on the pool, max Parallel at a time).
+    // Returns IP -> MAC for hosts that answered. Read-only: nothing is sent above layer 2.
+    static async Task<Dictionary<string, string>> ArpSweep(IEnumerable<uint> addrs, CancellationToken ct)
+    {
+        var d = new Dictionary<string, string>();
+        if (Environment.OSVersion.Platform != PlatformID.Win32NT) return d;
+        var gate = new SemaphoreSlim(Parallel);
+        await Task.WhenAll(addrs.Distinct().ToList().Select(async a =>
+        {
+            try { await gate.WaitAsync(ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+            try
+            {
+                if (ct.IsCancellationRequested) return;
+                var mac = await Task.Run(() => SendArpOne(a), ct).ConfigureAwait(false);
+                if (mac != null) lock (d) d[ToIp(a).ToString()] = mac;
+            }
+            catch (OperationCanceledException) { }
+            finally { gate.Release(); }
+        })).ConfigureAwait(false);
+        return d;
+    }
+
+    static string SendArpOne(uint a)
+    {
+        try
+        {
+            var mac = new byte[6]; int len = mac.Length;
+            if (SendARP(Swap(a), 0, mac, ref len) != 0 || len != 6 || mac.All(b => b == 0)) return null;
+            return string.Join("-", mac.Select(b => b.ToString("X2")));
+        }
+        catch { return null; }
     }
 
     static Dictionary<string, string> ArpTable()

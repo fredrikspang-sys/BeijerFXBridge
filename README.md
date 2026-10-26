@@ -65,6 +65,10 @@ The **Probe panel** button opens a read-only network scan to find the panel:
 - **Scan** checks the local subnet of each ticked network adapter (max 1024 addresses per range).
   Tailscale/ZeroTier/VPN adapters are unticked by default; tick one to scan its subnet and, for
   Tailscale, the subnet routes via that adapter plus peers from `tailscale status --json` (longer timeouts).
+- Before probing, every address in the on-link subnets of real (non-VPN, non-virtual) adapters gets an
+  ARP request (`SendARP`, 64 in parallel). Hosts that answer are probed and listed even if they ignore
+  ping and have nothing on the port. VPN, routed and *Extra range* targets outside the local segment use ping/TCP/UDP only.
+  The **Find** button does the same on physical Ethernet/Wi-Fi adapters.
 - Only likely panels are listed (Beijer MAC, TCP port open, or UDP open|filtered with no web server)
   plus the configured host; tick *Show all hosts* to list every responder.
 - *Extra range* accepts e.g. `192.168.3.0/24` or `10.0.2.1-50`.
@@ -72,7 +76,7 @@ The **Probe panel** button opens a read-only network scan to find the panel:
   ARP table and *Likely panel* (Beijer Electronics MAC OUI). MAC detection only works on the local L2 network.
 - Double-click a row or press **Use** to set Panel IP (and the protocol that answered).
 
-The probe only sends ping, TCP connects, one empty UDP datagram and an HTTP GET; no PLC data, no COM ports.
+The probe only sends ARP requests (local segment), ping, TCP connects, one empty UDP datagram and an HTTP GET; no PLC data, no COM ports.
 
 ## Build (Linux or Windows, .NET SDK)
 
